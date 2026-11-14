@@ -73,6 +73,11 @@ export default function Portal() {
   const [version, setVersion] = useState("");
   const [dragOver, setDragOver] = useState(false);
 
+  /* -------- optimizer payload (optional 2nd DLL) -------- */
+  const [optFile, setOptFile] = useState(null);
+  const [optMeta, setOptMeta] = useState(null);
+  const [optDrag, setOptDrag] = useState(false);
+
   /* -------- options -------- */
   const [commitMsg, setCommitMsg] = useState(DEFAULT_MSG);
   const [notes, setNotes] = useState("");
@@ -92,6 +97,7 @@ export default function Portal() {
   const [logs, setLogs] = useState([]);
 
   const fileInputRef = useRef(null);
+  const optInputRef = useRef(null);
 
   const log = useCallback((level, text) => {
     setLogs((prev) => [...prev.slice(-199), { level, text, t: new Date() }]);
@@ -241,6 +247,35 @@ export default function Portal() {
     handleFile(e.dataTransfer?.files?.[0]);
   };
 
+  /* -------- optimizer payload (optional) -------- */
+
+  const handleOptFile = async (f) => {
+    if (!f || busy) return;
+    if (!/\.dll$/i.test(f.name)) {
+      log("err", `"${f.name}" rejected — only .dll files are accepted`);
+      return;
+    }
+    setOptFile(f);
+    setOptMeta(null);
+    log("step", `Reading optimizer ${f.name} (${gh.fmtSize(f.size)})…`);
+    try {
+      const buf = await f.arrayBuffer();
+      const hash = await gh.sha256Hex(buf);
+      setOptMeta({ name: f.name, size: f.size, hash });
+      log("ok", `Optimizer SHA-256 ${hash}`);
+      setStatusText("Ready to push");
+    } catch (e) {
+      log("err", "Optimizer hash failed: " + e.message);
+      setStatusText("Hash failed");
+    }
+  };
+
+  const onOptDrop = (e) => {
+    e.preventDefault();
+    setOptDrag(false);
+    handleOptFile(e.dataTransfer?.files?.[0]);
+  };
+
   /* -------- dry-run validation -------- */
 
   const validate = async () => {
@@ -256,47 +291,62 @@ export default function Portal() {
     log("step", "DRY RUN — nothing will be pushed");
 
     try {
-      log("info", `Local  : ${fileMeta.name} — sha256 ${fileMeta.hash}`);
-      setProgress(14);
+      const targets = [{ name: fileMeta.name, hash: fileMeta.hash }];
+      if (optMeta) targets.push({ name: optMeta.name, hash: optMeta.hash });
+
+      log(
+        "info",
+        "Local  : " +
+          targets.map((t) => `${t.name} (${t.hash.slice(0, 12)}…)`).join("  |  ")
+      );
+      setProgress(12);
 
       const info = await gh.fetchLiveVersion(owner, repo, branch);
-      setProgress(26);
+      setProgress(22);
 
       if (!info.ok) {
         log("info", `Manifest: ${info.error} → push will initialize it`);
       } else {
         setLive(info);
-        log("info", `Manifest: v${info.version} — sha256 ${info.hash || "none"}`);
-        if (info.hash === fileMeta.hash) {
-          log("ok", "Already deployed — local file matches the live manifest");
-        } else {
-          log("step", "Update required — hashes differ, push will publish this build");
+        log(
+          "info",
+          `Manifest: v${info.version} — ${Object.keys(info.files || {}).length} file(s)`
+        );
+        for (const t of targets) {
+          const liveHash = info.files && info.files[t.name];
+          if (!liveHash) log("step", `${t.name}: not in the manifest yet → push will add it`);
+          else if (liveHash === t.hash) log("ok", `${t.name}: already deployed (hash matches)`);
+          else log("step", `${t.name}: update required — hashes differ`);
         }
       }
 
-      log("step", "Deep verify: downloading remote Client.dll…");
-      let remoteHash = null;
-      try {
-        remoteHash = await gh.downloadAndHash(`${rawDll}?_=${Date.now()}`, (p) =>
-          setProgress(26 + Math.round(p * 64))
-        );
-        log("info", `Remote : sha256 ${remoteHash}`);
-      } catch (e) {
-        log("info", `Remote Client.dll: ${e.message} → first push will create it`);
-      }
+      const base = 22;
+      const span = Math.floor(72 / targets.length);
 
-      setProgress(96);
+      for (let i = 0; i < targets.length; i++) {
+        const t = targets[i];
+        const from = base + i * span;
 
-      if (remoteHash) {
-        if (remoteHash === fileMeta.hash) {
-          log("ok", "GitHub already stores this exact DLL");
-        } else if (info.ok && info.hash && remoteHash === info.hash) {
-          log("ok", "GitHub verified IN SYNC — manifest matches the stored DLL");
-        } else {
-          log(
-            "err",
-            "GitHub OUT OF SYNC — version.json does not match Client.dll on the server (push will repair it)"
+        log("step", `Deep verify: downloading remote ${t.name}…`);
+        let remoteHash = null;
+        try {
+          remoteHash = await gh.downloadAndHash(
+            `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${t.name}?_=${Date.now()}`,
+            (p) => setProgress(from + Math.round(p * span))
           );
+          log("info", `Remote ${t.name}: sha256 ${remoteHash}`);
+        } catch (e) {
+          log("info", `Remote ${t.name}: ${e.message} → first push will create it`);
+        }
+
+        if (remoteHash) {
+          if (remoteHash === t.hash) {
+            log("ok", `${t.name}: GitHub already stores this exact file`);
+          } else if (info.ok && info.files && info.files[t.name] && remoteHash === info.files[t.name]) {
+            log("ok", `${t.name}: GitHub IN SYNC — manifest matches the stored file`);
+          } else {
+            log("err", `${t.name}: GitHub OUT OF SYNC — push will repair it`);
+          }
         }
       }
 
@@ -346,14 +396,14 @@ export default function Portal() {
     log("step", `Deploying v${ver} → ${o}/${r}@${b}`);
 
     try {
-      /* 1 — encode */
-      setProgress(10);
+      /* 1 — encode Client.dll */
+      setProgress(8);
       const b64 = await gh.fileToBase64(file);
-      setProgress(20);
+      setProgress(16);
 
-      /* 2 — DLL first, so version.json never points at a missing file */
+      /* 2 — Client.dll first, so version.json never points at a missing file */
       const dllInfo = await gh.getFileInfo(o, r, "Client.dll", b, t);
-      setProgress(26);
+      setProgress(20);
       log(
         "step",
         `Uploading Client.dll (${gh.fmtSize(file.size)}) — ${
@@ -369,16 +419,47 @@ export default function Portal() {
         branch: b,
         token: t,
         sha: dllInfo?.sha,
-        onProgress: (p) => setProgress(26 + Math.round(p * 44)),
+        onProgress: (p) => setProgress(20 + Math.round(p * 30)),
       });
-      setProgress(74);
+      setProgress(50);
       log("ok", "Client.dll committed");
 
-      /* 3 — version.json */
-      const manifest = gh.buildManifest(ver, fileMeta.hash);
-      const vInfo = await gh.getFileInfo(o, r, "version.json", b, t);
+      /* 3 — optimizer DLL (optional second payload) */
+      if (optFile && optMeta) {
+        setProgress(52);
+        const optB64 = await gh.fileToBase64(optFile);
+        const optInfo = await gh.getFileInfo(o, r, optMeta.name, b, t);
+        setProgress(56);
+        log(
+          "step",
+          `Uploading ${optMeta.name} (${gh.fmtSize(optFile.size)}) — ${
+            optInfo ? "updating existing blob" : "creating new blob"
+          }…`
+        );
+        await gh.putFile({
+          owner: o,
+          repo: r,
+          path: optMeta.name,
+          message: `Update ${optMeta.name} v${ver}`,
+          contentBase64: optB64,
+          branch: b,
+          token: t,
+          sha: optInfo?.sha,
+          onProgress: (p) => setProgress(56 + Math.round(p * 22)),
+        });
+        log("ok", `${optMeta.name} committed`);
+      }
       setProgress(80);
-      log("step", "Publishing version.json…");
+
+      /* 4 — version.json: merge what is already live with what we pushed */
+      const liveNow = await gh.fetchLiveVersion(o, r, b);
+      const filesMap = { ...(liveNow.ok ? liveNow.files || {} : {}) };
+      filesMap["Client.dll"] = fileMeta.hash;
+      if (optMeta) filesMap[optMeta.name] = optMeta.hash;
+
+      const manifest = gh.buildManifest(ver, filesMap);
+      const vInfo = await gh.getFileInfo(o, r, "version.json", b, t);
+      log("step", `Publishing version.json (${Object.keys(filesMap).length} file(s))…`);
       const vResp = await gh.putFile({
         owner: o,
         repo: r,
@@ -391,7 +472,7 @@ export default function Portal() {
         onProgress: (p) => setProgress(80 + Math.round(p * 12)),
       });
 
-      /* 4 — optional tag */
+      /* 5 — optional tag */
       if (makeTag) {
         const tagSha = vResp?.commit?.sha;
         if (tagSha) {
@@ -406,20 +487,27 @@ export default function Portal() {
 
       setProgress(94);
 
-      /* 5 — optional post-push deep verify */
+      /* 6 — optional post-push deep verify of every pushed file */
       if (verifyAfter) {
-        log("step", "Post-push verify: downloading the published DLL…");
-        try {
-          const remote = await gh.downloadAndHash(`${rawDll}?_=${Date.now()}`, (p) =>
-            setProgress(94 + Math.round(p * 5))
-          );
-          if (remote === fileMeta.hash) {
-            log("ok", "Post-push verify passed — GitHub serves your exact file");
-          } else {
-            log("err", "Post-push verify mismatch — CDN may still be stale, retry in a minute");
+        const verifyTargets = [{ name: "Client.dll", hash: fileMeta.hash }];
+        if (optMeta) verifyTargets.push({ name: optMeta.name, hash: optMeta.hash });
+
+        for (let i = 0; i < verifyTargets.length; i++) {
+          const vt = verifyTargets[i];
+          log("step", `Post-push verify: ${vt.name}…`);
+          try {
+            const remote = await gh.downloadAndHash(
+              `https://raw.githubusercontent.com/${o}/${r}/${b}/${vt.name}?_=${Date.now()}`,
+              (p) => setProgress(94 + Math.round(((i + p) / verifyTargets.length) * 5))
+            );
+            if (remote === vt.hash) {
+              log("ok", `Post-push verify passed — ${vt.name} matches your build`);
+            } else {
+              log("err", `Post-push verify mismatch for ${vt.name} — CDN may still be stale, retry in a minute`);
+            }
+          } catch (e) {
+            log("info", `Post-push verify skipped for ${vt.name}: ${e.message}`);
           }
-        } catch (e) {
-          log("info", `Post-push verify skipped: ${e.message}`);
         }
       }
 
@@ -443,6 +531,8 @@ export default function Portal() {
   const reset = () => {
     setFile(null);
     setFileMeta(null);
+    setOptFile(null);
+    setOptMeta(null);
     setPhase("idle");
     setProgress(0);
     setStatusText(session ? "Ready to push" : "Standing by");
@@ -584,7 +674,21 @@ export default function Portal() {
                 <div className="stat__val stat__val--dim" style={{ fontSize: 12 }}>
                   {live.ok && live.hash ? live.hash : "—"}
                 </div>
-                <div className="stat__sub">verified by the loader</div>
+                <div className="stat__sub">Client.dll · verified by the loader</div>
+              </div>
+
+              <div className="stat">
+                <div className="stat__key">Optimizer SHA-256</div>
+                <div className="stat__val stat__val--dim" style={{ fontSize: 12 }}>
+                  {live.ok && live.files && live.files["AimOptByDexter.dll"]
+                    ? live.files["AimOptByDexter.dll"]
+                    : "—"}
+                </div>
+                <div className="stat__sub">
+                  {live.ok && live.files && live.files["AimOptByDexter.dll"]
+                    ? "AimOptByDexter.dll published"
+                    : "optimizer not published yet"}
+                </div>
               </div>
 
               <div className="stat">
@@ -717,9 +821,9 @@ export default function Portal() {
             <div className="card__head">
               <div>
                 <div className="card__step">02 // payload</div>
-                <h2 className="card__title">Upload Client.dll</h2>
+                <h2 className="card__title">Upload DLLs</h2>
               </div>
-              <span className="card__hint">max 100 MB</span>
+              <span className="card__hint">max 100 MB each</span>
             </div>
 
             <div
@@ -739,7 +843,7 @@ export default function Portal() {
               <div className="drop__hint">
                 {fileMeta
                   ? fileMeta.name
-                  : "or click to browse · .dll only · hashed instantly"}
+                  : "Client.dll · required · click to browse · hashed instantly"}
               </div>
               <input
                 ref={fileInputRef}
@@ -765,6 +869,56 @@ export default function Portal() {
                   <span className="filemeta__key">SHA-256</span>
                   <span className="filemeta__val filemeta__val--hash">
                     {fileMeta.hash}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* ---- optimizer payload (optional) ---- */}
+            <div
+              className={`drop${optDrag ? " drop--over" : ""}`}
+              style={{ marginTop: 14, minHeight: 132 }}
+              onClick={() => optInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setOptDrag(true);
+              }}
+              onDragLeave={() => setOptDrag(false)}
+              onDrop={onOptDrop}
+            >
+              <UploadIcon />
+              <div className="drop__title">
+                {optMeta ? "Replace optimizer" : "Drop optimizer DLL"}
+              </div>
+              <div className="drop__hint">
+                {optMeta
+                  ? optMeta.name
+                  : "AimOptByDexter.dll · optional · pushed as its own commit"}
+              </div>
+              <input
+                ref={optInputRef}
+                type="file"
+                accept=".dll,application/octet-stream"
+                onChange={(e) => handleOptFile(e.target.files?.[0])}
+              />
+            </div>
+
+            {optMeta && (
+              <div className="filemeta">
+                <div className="filemeta__row">
+                  <span className="filemeta__key">File</span>
+                  <span className="filemeta__val filemeta__name">
+                    {optMeta.name}
+                  </span>
+                </div>
+                <div className="filemeta__row">
+                  <span className="filemeta__key">Size</span>
+                  <span className="filemeta__val">{gh.fmtSize(optMeta.size)}</span>
+                </div>
+                <div className="filemeta__row">
+                  <span className="filemeta__key">SHA-256</span>
+                  <span className="filemeta__val filemeta__val--hash">
+                    {optMeta.hash}
                   </span>
                 </div>
               </div>
@@ -939,6 +1093,16 @@ export default function Portal() {
               <a className="link-chip" href={rawDll} target="_blank" rel="noreferrer">
                 <ExtIcon /> Raw Client.dll
               </a>
+              {live.ok && live.files && live.files["AimOptByDexter.dll"] && (
+                <a
+                  className="link-chip"
+                  href={`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/AimOptByDexter.dll`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <ExtIcon /> Raw optimizer
+                </a>
+              )}
               <a
                 className="link-chip"
                 href={rawManifest}
@@ -966,7 +1130,9 @@ export default function Portal() {
                 <div className="success__body">
                   <div className="success__title">Deployment sealed</div>
                   <div className="success__text">
-                    Client.dll + version.json are committed
+                    {optMeta
+                      ? `Client.dll + ${optMeta.name} + version.json are committed`
+                      : "Client.dll + version.json are committed"}
                     {makeTag ? ` and tagged v${version}` : ""}. The loader will
                     pull this build on its next update check — GitHub&apos;s raw
                     CDN refreshes within about five minutes.
